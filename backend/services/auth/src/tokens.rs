@@ -1,3 +1,8 @@
+// This module is not yet wired into any live HTTP handler in `main.rs` — it's
+// compiled and unit tested here, but nothing in the running service calls it
+// today. Suppress dead_code accordingly rather than scattering allows.
+#![allow(dead_code)]
+
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
@@ -76,11 +81,17 @@ impl RevocationList {
     }
 
     pub fn revoke(&self, jti: Uuid) {
-        self.revoked_jtis.lock().unwrap().insert(jti);
+        self.revoked_jtis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(jti);
     }
 
     pub fn is_revoked(&self, jti: &Uuid) -> bool {
-        self.revoked_jtis.lock().unwrap().contains(jti)
+        self.revoked_jtis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(jti)
     }
 }
 
@@ -171,6 +182,25 @@ mod tests {
 
         let result = verify_access_token_with_revocation(&token, secret, &rev_list);
         assert!(matches!(result, Err(TokenError::Revoked)));
+    }
+
+    #[test]
+    fn revocation_check_survives_poisoned_lock() {
+        let rev_list = RevocationList::new();
+        let jti = Uuid::new_v4();
+
+        // Poison the lock by panicking while holding it in another thread.
+        let list_clone = rev_list.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = list_clone.revoked_jtis.lock().unwrap();
+            panic!("simulated panic while holding lock");
+        });
+        assert!(handle.join().is_err());
+
+        // Revocation checks must still work (not panic) after the lock is poisoned.
+        assert!(!rev_list.is_revoked(&jti));
+        rev_list.revoke(jti);
+        assert!(rev_list.is_revoked(&jti));
     }
 
     #[test]

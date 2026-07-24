@@ -1,3 +1,5 @@
+mod tokens;
+
 use actix_web::{middleware, web, App, HttpResponse, HttpServer};
 use rand::RngCore;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -196,7 +198,7 @@ fn rand_string(len: usize) -> String {
     use std::time::SystemTime;
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     
     (0..len)
@@ -361,7 +363,7 @@ async fn logout(
     }
 
     if let Some(token) = &body.refresh_token {
-        let mut map = store.lock().unwrap();
+        let mut map = store.lock().unwrap_or_else(|e| e.into_inner());
         if map.remove(token).is_some() {
             return HttpResponse::Ok().json(ApiResponse::ok(
                 serde_json::json!({ "revoked": 1 }),
@@ -380,7 +382,7 @@ async fn logout(
 pub fn create_jwt(public_key: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let expiration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .unwrap_or_default()
         .as_secs() as usize
         + 24 * 3600;
 
@@ -405,10 +407,10 @@ pub fn issue_refresh_token(store: &RefreshStore, subject: &str) -> String {
     let family_id = generate_nonce();
     let expires_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         + 30 * 24 * 3600; // 30 days
-    store.lock().unwrap().insert(
+    store.lock().unwrap_or_else(|e| e.into_inner()).insert(
         token.clone(),
         RefreshEntry {
             subject: subject.to_string(),
@@ -426,12 +428,12 @@ pub fn consume_refresh_token(
     used_store: &UsedTokenStore,
     token: &str,
 ) -> Result<String, &'static str> {
-    let mut map = store.lock().unwrap();
+    let mut map = store.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(entry) = map.remove(token) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         if entry.expires_at <= now {
             return Err("expired");
@@ -439,13 +441,13 @@ pub fn consume_refresh_token(
         // Record as used for reuse detection
         used_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(token.to_string(), entry.subject.clone());
         return Ok(entry.subject);
     }
 
     // Check if this token was already consumed (reuse = theft)
-    let used = used_store.lock().unwrap();
+    let used = used_store.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(subject) = used.get(token) {
         let subject = subject.clone();
         drop(used);
@@ -463,7 +465,7 @@ pub fn consume_refresh_token(
 
 /// Revoke all tokens for a given subject
 pub fn revoke_all_tokens_for_subject(store: &RefreshStore, subject: &str) -> usize {
-    let mut map = store.lock().unwrap();
+    let mut map = store.lock().unwrap_or_else(|e| e.into_inner());
     let before = map.len();
     map.retain(|_, entry| entry.subject != subject);
     before - map.len()

@@ -12,6 +12,7 @@ members = [
     "contracts/test-utils",
     "services/api",
     "services/auth",
+    "services/notifications",
     "tests",
 ]
 resolver = "2"
