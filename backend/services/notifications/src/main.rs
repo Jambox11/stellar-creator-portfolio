@@ -34,6 +34,19 @@ async fn ready() -> HttpResponse {
     }))
 }
 
+/// Resolve the host/port the health-check server should bind to from raw
+/// env var values. Pulled out as a pure function so bootstrap parsing can be
+/// unit tested without touching real process environment state.
+fn resolve_server_config(port_var: Option<&str>, host_var: Option<&str>) -> (String, u16) {
+    let port = port_var
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3003);
+    let host = host_var
+        .map(str::to_string)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    (host, port)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize structured logging
@@ -72,12 +85,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start the HTTP server for health/readiness probes in the background
-    let port: u16 = std::env::var("NOTIFICATIONS_PORT")
-        .unwrap_or_else(|_| "3003".to_string())
-        .parse()
-        .unwrap_or(3003);
-    let host = std::env::var("NOTIFICATIONS_HOST")
-        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let (host, port) = resolve_server_config(
+        std::env::var("NOTIFICATIONS_PORT").ok().as_deref(),
+        std::env::var("NOTIFICATIONS_HOST").ok().as_deref(),
+    );
 
     tracing::info!("Health endpoints available on {}:{}", host, port);
 
@@ -95,3 +106,43 @@ async fn main() -> anyhow::Result<()> {
 
     server.await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_server_config_uses_provided_values() {
+        let (host, port) = resolve_server_config(Some("8080"), Some("127.0.0.1"));
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_server_config_defaults_when_missing() {
+        let (host, port) = resolve_server_config(None, None);
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(port, 3003);
+    }
+
+    #[test]
+    fn resolve_server_config_falls_back_on_malformed_port() {
+        let (host, port) = resolve_server_config(Some("not-a-port"), None);
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(port, 3003);
+    }
+
+    #[test]
+    fn resolve_server_config_falls_back_on_out_of_range_port() {
+        let (_, port) = resolve_server_config(Some("999999"), None);
+        assert_eq!(port, 3003);
+    }
+
+    #[test]
+    fn resolve_server_config_uses_custom_host_with_default_port() {
+        let (host, port) = resolve_server_config(None, Some("192.168.1.1"));
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 3003);
+    }
+}

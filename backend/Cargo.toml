@@ -13,6 +13,7 @@ members = [
     "services/api",
     "services/auth",
     "services/discovery",
+    "services/notifications",
     "tests",
 ]
 resolver = "2"

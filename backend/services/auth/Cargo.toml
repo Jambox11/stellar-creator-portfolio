@@ -34,3 +34,11 @@ uuid.workspace = true
 chrono.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true
+# rust_crypto: jsonwebtoken 10 requires an explicit crypto backend (rust_crypto
+# or aws_lc_rs) or every sign/verify call panics at runtime with "Could not
+# automatically determine the process-level CryptoProvider". Pure-Rust backend
+# chosen to match the crate's existing deps (ed25519-dalek, sha2, rand) and
+# avoid an aws-lc-rs C/cmake build dependency.
+jsonwebtoken = { version = "10.4", features = ["use_pem", "rust_crypto"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = "0.4"
