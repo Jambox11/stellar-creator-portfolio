@@ -62,11 +62,19 @@ pub async fn register_webhook(
         events: body.events.clone(),
     };
 
+    let serialized = match serde_json::to_string(&webhook) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to serialize webhook {}: {}", webhook.id, e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "success": false,
+                "error": "Failed to register webhook"
+            }));
+        }
+    };
+
     if let Ok(mut conn) = redis.get().await {
-        let _: () = conn
-            .hset(REDIS_KEY, &webhook.id, serde_json::to_string(&webhook).unwrap())
-            .await
-            .unwrap_or(());
+        let _: () = conn.hset(REDIS_KEY, &webhook.id, serialized).await.unwrap_or(());
     }
 
     HttpResponse::Created().json(ApiResponse::ok(
