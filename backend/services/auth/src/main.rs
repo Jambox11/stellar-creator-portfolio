@@ -1,3 +1,16 @@
+// These modules implement an OAuth2 + Postgres-backed refresh-token auth
+// flow that is not yet wired into the routes below (the live server still
+// uses the ed25519/TOTP flow in this file). Kept compiling + tested so the
+// dead code doesn't bit-rot silently.
+#[allow(dead_code)]
+mod config;
+#[allow(dead_code)]
+mod db;
+#[allow(dead_code)]
+mod error;
+#[allow(dead_code)]
+mod handlers;
+#[allow(dead_code)]
 mod tokens;
 
 use actix_web::{middleware, web, App, HttpResponse, HttpServer};
