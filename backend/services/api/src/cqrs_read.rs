@@ -277,3 +277,237 @@ impl ReadStore {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cqrs_write::{handle_command, Command};
+
+    #[test]
+    fn bounty_created_populates_bounty_and_search_views() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Design a logo".to_string(),
+            budget_usd: 500,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_000,
+        });
+
+        let bounty = store.bounties.get("b-1").expect("bounty should be projected");
+        assert_eq!(bounty.status, "open");
+        assert_eq!(bounty.application_count, 0);
+
+        let search_view = store.search_views.get("b-1").expect("search view should be projected");
+        assert!(search_view.needs_refresh);
+    }
+
+    #[test]
+    fn full_bounty_lifecycle_projects_in_order() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Design a logo".to_string(),
+            budget_usd: 500,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_000,
+        });
+        project_event(&mut store, &DomainEvent::BountyApplicationReceived {
+            application_id: "app-1".to_string(),
+            bounty_id: "b-1".to_string(),
+            freelancer_id: "freelancer-1".to_string(),
+            proposed_budget_usd: 450,
+            occurred_at: 1_600_000_100,
+        });
+        project_event(&mut store, &DomainEvent::FreelancerSelected {
+            bounty_id: "b-1".to_string(),
+            application_id: "app-1".to_string(),
+            occurred_at: 1_600_000_200,
+        });
+        project_event(&mut store, &DomainEvent::BountyCompleted {
+            bounty_id: "b-1".to_string(),
+            occurred_at: 1_600_000_300,
+        });
+
+        let bounty = store.bounties.get("b-1").unwrap();
+        assert_eq!(bounty.application_count, 1);
+        assert_eq!(bounty.status, "completed");
+        assert_eq!(bounty.selected_freelancer_id, Some("app-1".to_string()));
+        assert_eq!(bounty.completed_at, Some(1_600_000_300));
+
+        // open_bounties() must not surface a completed bounty.
+        assert!(store.open_bounties().is_empty());
+    }
+
+    #[test]
+    fn out_of_order_events_for_unknown_aggregate_are_dropped_not_panicked() {
+        let mut store = ReadStore::default();
+        // Application/selection/completion events arrive before the bounty's
+        // own BountyCreated event has been projected (e.g. redelivered out of
+        // sequence). The projector must no-op rather than panic or fabricate
+        // a bounty view.
+        project_event(&mut store, &DomainEvent::BountyApplicationReceived {
+            application_id: "app-1".to_string(),
+            bounty_id: "b-missing".to_string(),
+            freelancer_id: "freelancer-1".to_string(),
+            proposed_budget_usd: 450,
+            occurred_at: 1_600_000_100,
+        });
+        project_event(&mut store, &DomainEvent::BountyCompleted {
+            bounty_id: "b-missing".to_string(),
+            occurred_at: 1_600_000_200,
+        });
+
+        assert!(store.bounties.get("b-missing").is_none());
+    }
+
+    #[test]
+    fn escrow_deposit_release_and_refund_update_status() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::EscrowDeposited {
+            escrow_id: "e-1".to_string(),
+            bounty_id: "b-1".to_string(),
+            payer_id: "payer-1".to_string(),
+            payee_id: "payee-1".to_string(),
+            amount_usd: 500,
+            occurred_at: 1_600_000_000,
+        });
+        assert_eq!(store.escrows.get("e-1").unwrap().status, "active");
+
+        project_event(&mut store, &DomainEvent::EscrowReleased {
+            escrow_id: "e-1".to_string(),
+            authorizer_id: "auth-1".to_string(),
+            occurred_at: 1_600_000_100,
+        });
+        let escrow = store.escrows.get("e-1").unwrap();
+        assert_eq!(escrow.status, "released");
+        assert_eq!(escrow.settled_at, Some(1_600_000_100));
+    }
+
+    #[test]
+    fn escrow_refund_for_unknown_escrow_is_ignored() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::EscrowRefunded {
+            escrow_id: "e-missing".to_string(),
+            authorizer_id: "auth-1".to_string(),
+            occurred_at: 1_600_000_000,
+        });
+        assert!(store.escrows.get("e-missing").is_none());
+    }
+
+    #[test]
+    fn review_submitted_computes_incremental_average() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::ReviewSubmitted {
+            review_id: "r-1".to_string(),
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            rating: 4,
+            zk_nullifier: "n-1".to_string(),
+            occurred_at: 1_600_000_000,
+        });
+        project_event(&mut store, &DomainEvent::ReviewSubmitted {
+            review_id: "r-2".to_string(),
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            rating: 5,
+            zk_nullifier: "n-2".to_string(),
+            occurred_at: 1_600_000_100,
+        });
+
+        let rep = store.creator_reputation("creator-1").expect("reputation should exist");
+        assert_eq!(rep.total_reviews, 2);
+        assert_eq!(rep.average_rating, 4.5);
+    }
+
+    #[test]
+    fn creator_reputation_returns_none_for_creator_with_no_reviews() {
+        let store = ReadStore::default();
+        assert!(store.creator_reputation("nobody").is_none());
+    }
+
+    #[test]
+    fn open_bounties_sorted_newest_first() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-older".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Older".to_string(),
+            budget_usd: 100,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_000,
+        });
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-newer".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Newer".to_string(),
+            budget_usd: 200,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_500,
+        });
+
+        let open = store.open_bounties();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].bounty_id, "b-newer");
+        assert_eq!(open[1].bounty_id, "b-older");
+    }
+
+    #[test]
+    fn search_bounties_excludes_cancelled_and_matches_case_insensitively() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Design a Landing Page".to_string(),
+            budget_usd: 500,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_000,
+        });
+        store.search_views.get_mut("b-1").unwrap().status = "cancelled".to_string();
+
+        assert!(store.search_bounties("landing").is_empty());
+    }
+
+    #[test]
+    fn schedule_search_view_refresh_and_drain_round_trip() {
+        let mut store = ReadStore::default();
+        project_event(&mut store, &DomainEvent::BountyCreated {
+            bounty_id: "b-1".to_string(),
+            creator_id: "creator-1".to_string(),
+            title: "Design a logo".to_string(),
+            budget_usd: 500,
+            deadline_ts: 1_700_000_000,
+            occurred_at: 1_600_000_000,
+        });
+        // Creation already flags needs_refresh; drain it first so the next
+        // assertion is about schedule_search_view_refresh specifically.
+        assert_eq!(store.drain_pending_refreshes(), vec!["b-1".to_string()]);
+        assert!(store.drain_pending_refreshes().is_empty());
+
+        schedule_search_view_refresh(&mut store, "b-1");
+        assert_eq!(store.drain_pending_refreshes(), vec!["b-1".to_string()]);
+    }
+
+    #[test]
+    fn events_from_command_handler_project_end_to_end() {
+        // Exercise the write-side handler and read-side projector together,
+        // matching how the real event log would drive both sides.
+        let mut store = ReadStore::default();
+        let events = handle_command(
+            Command::CreateBounty {
+                bounty_id: "b-1".to_string(),
+                creator_id: "creator-1".to_string(),
+                title: "Design a logo".to_string(),
+                budget_usd: 500,
+                deadline_ts: 1_700_000_000,
+            },
+            1_600_000_000,
+        ).unwrap();
+        for event in &events {
+            project_event(&mut store, event);
+        }
+        assert!(store.bounties.contains_key("b-1"));
+    }
+}
