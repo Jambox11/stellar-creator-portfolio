@@ -13,10 +13,16 @@ pub const PLATFORM_FEE_BPS: i128 = 250;
 /// Maximum platform fee cap (500 units)
 pub const PLATFORM_FEE_CAP: i128 = 500;
 
+/// Default multi-sig threshold: bounties with budget ≥ this value require M-of-N
+/// authorisation before the payment is released. Governance can override this via
+/// `set_multisig_threshold`. Units match the contract's `budget` field (i128).
+pub const MULTISIG_THRESHOLD: i128 = 1_000;
+
 /// Calculate platform fee for a given budget
 pub fn platform_fee(budget: i128) -> i128 {
     let raw = budget * PLATFORM_FEE_BPS / 10_000;
     if raw > PLATFORM_FEE_CAP { PLATFORM_FEE_CAP } else { raw }
+}
 // Re-export ReleaseCondition from escrow contract for cross-contract calls
 #[derive(Clone, Debug)]
 #[contracttype]
@@ -33,6 +39,10 @@ pub enum BountyError {
     DeadlineNotPassed = 1,
     AlreadyProcessed = 2,
     InsufficientBalance = 3,
+    /// Bounty budget exceeds the multi-sig threshold and no signer set is configured.
+    MultisigNotConfigured = 4,
+    /// Fewer signers authorised than the required minimum (M-of-N not satisfied).
+    InsufficientSigners = 5,
 }
 
 /// DataKey for typed storage lookups
@@ -40,6 +50,12 @@ pub enum BountyError {
 #[contracttype]
 pub enum DataKey {
     EscrowContract,
+    /// Ordered list of authorised multi-sig signers (Address).
+    MultisigSigners,
+    /// Minimum number of signers required (M in M-of-N). Defaults to 2.
+    MultisigRequired,
+    /// Governance-configurable threshold above which multi-sig is enforced.
+    MultisigThreshold,
 }
 
 /// Escrow Contract Client Interface
@@ -102,6 +118,77 @@ impl BountyContract {
         true
     }
 
+    // ── Multi-sig governance (issue #740) ────────────────────────────────────
+
+    /// Configure the M-of-N signer set for high-value bounty payments.
+    ///
+    /// Only the stored contract admin (governance multisig) may call this.
+    /// `signers` is the full ordered list of authorised addresses; `required`
+    /// is the minimum number of them that must call `require_auth()` before
+    /// `complete_bounty` proceeds for budgets above the threshold.
+    pub fn set_multisig_signers(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        required: u32,
+    ) -> bool {
+        admin.require_auth();
+        let stored_admin_key = Symbol::new(&env, "bounty_admin");
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Address>(&stored_admin_key)
+            .expect("Contract admin not set");
+        assert_eq!(admin, stored_admin, "unauthorized");
+        assert!(required > 0, "required must be > 0");
+        assert!(
+            required <= signers.len() as u32,
+            "required must be <= number of signers"
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigSigners, &signers);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigRequired, &required);
+
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("updated")),
+            (required, signers.len() as u32),
+        );
+
+        true
+    }
+
+    /// Update the budget threshold above which multi-sig is enforced.
+    /// Only the contract admin may call this.
+    pub fn set_multisig_threshold(env: Env, admin: Address, threshold: i128) -> bool {
+        admin.require_auth();
+        let stored_admin_key = Symbol::new(&env, "bounty_admin");
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Address>(&stored_admin_key)
+            .expect("Contract admin not set");
+        assert_eq!(admin, stored_admin, "unauthorized");
+        assert!(threshold > 0, "threshold must be > 0");
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigThreshold, &threshold);
+
+        true
+    }
+
+    /// Return the configured multi-sig threshold (or the compile-time default).
+    pub fn get_multisig_threshold(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::MultisigThreshold)
+            .unwrap_or(MULTISIG_THRESHOLD)
+    }
+
     fn get_escrow_contract(env: &Env) -> Address {
         env.storage()
             .persistent()
@@ -148,6 +235,11 @@ impl BountyContract {
         env.storage()
             .persistent()
             .set(&bounty_counter_key, &counter);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("created")),
+            (bounty_id, creator, budget, deadline),
+        );
 
         bounty_id
     }
@@ -241,6 +333,11 @@ impl BountyContract {
             .persistent()
             .set(&app_counter_key, &counter);
 
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("applied")),
+            (bounty_id, application_id, freelancer),
+        );
+
         application_id
     }
 
@@ -269,10 +366,16 @@ impl BountyContract {
         let application = Self::get_application(env.clone(), application_id);
         assert_eq!(application.bounty_id, bounty_id, "Application does not match bounty");
 
-        bounty.selected_freelancer = Some(application.freelancer);
+        let selected = application.freelancer;
+        bounty.selected_freelancer = Some(selected.clone());
         bounty.status = BountyStatus::InProgress;
 
         env.storage().persistent().set(&bounty_key, &bounty);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("selected")),
+            (bounty_id, application_id, selected),
+        );
 
         true
     }
@@ -322,10 +425,53 @@ impl BountyContract {
             "Freelancer must submit completion before creator can approve"
         );
 
+        // #740: Bounties above the multi-sig threshold require M-of-N signer
+        // authorisation before the payment is released.
+        let threshold = Self::get_multisig_threshold(env.clone());
+        if bounty.budget >= threshold {
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Vec<Address>>(&DataKey::MultisigSigners)
+                .expect("Multi-sig signer set not configured for high-value bounty");
+
+            let required: u32 = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::MultisigRequired)
+                .unwrap_or(2);
+
+            // Collect auth from each signer; count how many authorised.
+            let mut auth_count: u32 = 0;
+            for signer in signers.iter() {
+                signer.require_auth();
+                auth_count += 1;
+                if auth_count >= required {
+                    break;
+                }
+            }
+
+            assert!(
+                auth_count >= required,
+                "Insufficient multi-sig authorisations for high-value bounty"
+            );
+
+            env.events().publish(
+                (symbol_short!("bounty"), symbol_short!("multisig")),
+                (bounty_id, auth_count, required),
+            );
+        }
+
         bounty.status = BountyStatus::Completed;
-        bounty.completed_at = Some(env.ledger().timestamp());
+        let completed_at = env.ledger().timestamp();
+        bounty.completed_at = Some(completed_at);
 
         env.storage().persistent().set(&bounty_key, &bounty);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("completed")),
+            (bounty_id, completed_at),
+        );
 
         true
     }
@@ -344,6 +490,11 @@ impl BountyContract {
         bounty.status = BountyStatus::Cancelled;
 
         env.storage().persistent().set(&bounty_key, &bounty);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("cancelled")),
+            (bounty_id,),
+        );
 
         true
     }
@@ -468,6 +619,44 @@ impl BountyContract {
         let base_resource = BOUNTY_CREATE_BASE_FEE;
         platform + base_resource
     }
+
+    // ── Issue #732: Contract upgrade mechanism ────────────────────────────────
+
+    /// Upgrade the contract WASM. Only the governance multisig (contract admin)
+    /// may call this. Emits an `upgraded` event with the new wasm hash.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        admin.require_auth();
+        let admin_key = DataKey::EscrowContract; // reuse admin storage slot via escrow contract key?
+        // Bounty contract uses a standalone admin key
+        let stored_admin_key = Symbol::new(&env, "bounty_admin");
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Address>(&stored_admin_key)
+            .expect("Contract admin not set");
+        assert_eq!(admin, stored_admin, "unauthorized");
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("upgraded")),
+            new_wasm_hash,
+        );
+    }
+
+    /// Set the bounty contract admin (governance multisig). Can only be called once.
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin_key = Symbol::new(&env, "bounty_admin");
+        assert!(
+            env.storage()
+                .persistent()
+                .get::<Symbol, Address>(&stored_admin_key)
+                .is_none(),
+            "Admin already set"
+        );
+        env.storage().persistent().set(&stored_admin_key, &admin);
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +719,87 @@ mod tests {
 
         let application = contract.get_application(&app_id);
         assert_eq!(application.freelancer, freelancer);
+    }
+
+    #[test]
+    fn test_multisig_complete_bounty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract = BountyContractClient::new(&env, &env.register_contract(None, BountyContract));
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+
+        contract.set_admin(&admin);
+
+        // Configure 2-of-2 multi-sig with threshold of 1000
+        let mut signers = soroban_sdk::Vec::new(&env);
+        signers.push_back(signer1.clone());
+        signers.push_back(signer2.clone());
+        contract.set_multisig_signers(&admin, &signers, &2u32);
+        assert_eq!(contract.get_multisig_threshold(), MULTISIG_THRESHOLD);
+
+        // Create a high-value bounty (budget >= threshold)
+        let bounty_id = contract.create_bounty(
+            &creator,
+            &String::from_str(&env, "High-Value Bounty"),
+            &String::from_str(&env, "Requires multi-sig"),
+            &(MULTISIG_THRESHOLD + 500),
+            &100u64,
+        );
+
+        let app_id = contract.apply_for_bounty(
+            &bounty_id,
+            &freelancer,
+            &String::from_str(&env, "I can do this"),
+            &MULTISIG_THRESHOLD,
+            &30u64,
+        );
+
+        contract.select_freelancer(&bounty_id, &app_id);
+        contract.submit_completion(&bounty_id, &freelancer);
+
+        // With mock_all_auths, all require_auth calls pass — completion succeeds
+        let result = contract.complete_bounty(&bounty_id);
+        assert!(result);
+
+        let bounty = contract.get_bounty(&bounty_id);
+        assert_eq!(bounty.status, BountyStatus::Completed);
+    }
+
+    #[test]
+    fn test_low_value_bounty_no_multisig_needed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract = BountyContractClient::new(&env, &env.register_contract(None, BountyContract));
+
+        let creator = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        // Budget below threshold — no multi-sig required
+        let bounty_id = contract.create_bounty(
+            &creator,
+            &String::from_str(&env, "Small Bounty"),
+            &String::from_str(&env, "No multi-sig needed"),
+            &500i128, // below MULTISIG_THRESHOLD of 1000
+            &100u64,
+        );
+
+        let app_id = contract.apply_for_bounty(
+            &bounty_id,
+            &freelancer,
+            &String::from_str(&env, "I'll do it"),
+            &500i128,
+            &7u64,
+        );
+
+        contract.select_freelancer(&bounty_id, &app_id);
+        contract.submit_completion(&bounty_id, &freelancer);
+        let result = contract.complete_bounty(&bounty_id);
+        assert!(result);
     }
 
     #[test]

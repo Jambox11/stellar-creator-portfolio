@@ -15,6 +15,7 @@ import {
   deleteUser,
   getUsersSummary,
 } from '@/app/admin/actions';
+import { KYCReviewPanel } from '@/components/admin/kyc-review-panel';
 import { Role } from '@prisma/client';
 
 const ROLES: Role[] = ['ADMIN', 'CLIENT', 'CREATOR', 'USER'];
@@ -225,7 +226,15 @@ export default function AdminUsersPage() {
               </thead>
               <tbody>
                 {loading ? (
-                  <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground text-sm">Loading...</td></tr>
+                  Array.from({ length: 8 }).map((_, i) => (
+                    <tr key={i} className="border-b border-border">
+                      {Array.from({ length: 7 }).map((__, j) => (
+                        <td key={j} className="px-4 py-3">
+                          <div className="h-4 bg-muted rounded animate-pulse" style={{ width: j === 1 ? '80%' : '60%' }} />
+                        </td>
+                      ))}
+                    </tr>
+                  ))
                 ) : filtered.length === 0 ? (
                   <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground text-sm">No users found</td></tr>
                 ) : filtered.map((user) => (
@@ -276,6 +285,8 @@ export default function AdminUsersPage() {
           </div>
         </CardContent>
       </Card>
+
+      <KYCReviewPanel />
     </div>
   );
 }

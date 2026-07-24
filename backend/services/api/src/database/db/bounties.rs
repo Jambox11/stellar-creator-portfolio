@@ -79,3 +79,70 @@ pub fn apply_for_bounty(bounty_id: u64, application: BountyApplication) -> Resul
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_application(bounty_id: u64) -> BountyApplication {
+        BountyApplication {
+            bounty_id,
+            freelancer: "GFREELANCER".to_string(),
+            proposal: "I can build this".to_string(),
+            proposed_budget: 500,
+            timeline: 7,
+        }
+    }
+
+    #[test]
+    fn get_bounty_by_id_returns_none_for_unknown_id() {
+        assert!(get_bounty_by_id(9999).is_none());
+    }
+
+    #[test]
+    fn get_bounty_by_id_returns_some_for_known_id() {
+        let bounty = get_bounty_by_id(2).expect("bounty 2 exists in mock data");
+        assert_eq!(bounty.creator, "jordan-dev");
+    }
+
+    #[test]
+    fn create_bounty_always_starts_open() {
+        let request = BountyRequest {
+            creator: "test-creator".to_string(),
+            title: "Test Bounty".to_string(),
+            description: "Test Description".to_string(),
+            budget: 1000,
+            deadline: 1234567890,
+        };
+        let created = create_bounty(request);
+        assert_eq!(created.status, "open");
+        assert_eq!(created.budget, 1000);
+    }
+
+    #[test]
+    fn apply_for_bounty_rejects_empty_proposal() {
+        let mut application = sample_application(1);
+        application.proposal = "   ".to_string();
+        let result = apply_for_bounty(1, application);
+        assert_eq!(result, Err("Proposal cannot be empty".to_string()));
+    }
+
+    #[test]
+    fn apply_for_bounty_rejects_non_positive_budget() {
+        let mut application = sample_application(1);
+        application.proposed_budget = 0;
+        let result = apply_for_bounty(1, application);
+        assert_eq!(result, Err("Proposed budget must be positive".to_string()));
+
+        let mut negative_application = sample_application(1);
+        negative_application.proposed_budget = -100;
+        let result = apply_for_bounty(1, negative_application);
+        assert_eq!(result, Err("Proposed budget must be positive".to_string()));
+    }
+
+    #[test]
+    fn apply_for_bounty_accepts_valid_application() {
+        let application = sample_application(1);
+        assert_eq!(apply_for_bounty(1, application), Ok(()));
+    }
+}

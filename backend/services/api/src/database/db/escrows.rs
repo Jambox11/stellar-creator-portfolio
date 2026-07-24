@@ -101,3 +101,56 @@ fn chrono_now() -> String {
     // Stable timestamp placeholder — real impl would use chrono or time crate
     "2026-01-01T00:00:00Z".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_request() -> EscrowCreateRequest {
+        EscrowCreateRequest {
+            bounty_id: "test-bounty".to_string(),
+            payer_address: "GPAYER".to_string(),
+            payee_address: "GPAYEE".to_string(),
+            amount: 1000,
+            token: "GUSDC".to_string(),
+            timelock: None,
+        }
+    }
+
+    #[test]
+    fn get_escrow_by_id_returns_none_for_unknown_id() {
+        assert!(get_escrow_by_id(9999).is_none());
+    }
+
+    #[test]
+    fn create_escrow_starts_pending_and_preserves_optional_timelock() {
+        let created = create_escrow(sample_request());
+        assert_eq!(created.status, "pending");
+        assert_eq!(created.timelock, None);
+        assert!(created.transaction_hash.is_some());
+    }
+
+    #[test]
+    fn release_escrow_updates_status_for_existing_escrow() {
+        let released = release_escrow(1).expect("escrow 1 exists in mock data");
+        assert_eq!(released.status, "released");
+        assert_eq!(released.transaction_hash, Some("tx_release_1".to_string()));
+    }
+
+    #[test]
+    fn release_escrow_returns_none_for_unknown_id() {
+        assert!(release_escrow(9999).is_none());
+    }
+
+    #[test]
+    fn refund_escrow_updates_status_for_existing_escrow() {
+        let refunded = refund_escrow(2, "GAUTHORIZER".to_string()).expect("escrow 2 exists in mock data");
+        assert_eq!(refunded.status, "refunded");
+        assert_eq!(refunded.transaction_hash, Some("tx_refund_2".to_string()));
+    }
+
+    #[test]
+    fn refund_escrow_returns_none_for_unknown_id() {
+        assert!(refund_escrow(9999, "GAUTHORIZER".to_string()).is_none());
+    }
+}
