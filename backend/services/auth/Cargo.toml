@@ -28,5 +28,9 @@ thiserror.workspace = true
 rand = { version = "0.8", features = ["getrandom"] }
 urlencoding = "2.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-jsonwebtoken = { version = "10.4", features = ["use_pem"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+jsonwebtoken = { version = "10.4", features = ["use_pem", "rust_crypto"] }
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+oauth2.workspace = true
+reqwest.workspace = true
