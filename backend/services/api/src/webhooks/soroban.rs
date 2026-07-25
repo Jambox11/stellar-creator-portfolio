@@ -5,6 +5,8 @@
 /// the Soroban contracts indexed by the event indexer.
 use actix_web::{web, HttpRequest, HttpResponse};
 use deadpool_redis::{redis::AsyncCommands, Pool};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -29,6 +31,8 @@ pub struct Webhook {
     pub owner: String,
     pub url: String,
     pub events: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -77,6 +81,7 @@ pub async fn register_webhook(
         owner: claims.sub.clone(),
         url: body.url.clone(),
         events: body.events.clone(),
+        secret: body.secret.clone(),
     };
 
     let serialized = match serde_json::to_string(&webhook) {
@@ -209,8 +214,31 @@ pub async fn trigger_webhooks(redis: &Pool, event: &str, data: serde_json::Value
         let client = client.clone();
         let payload = payload.clone();
         let url = wh.url.clone();
+        let secret = wh.secret.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = client.post(&url).json(&payload).send().await {
+            let payload_bytes = match serde_json::to_vec(&payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to serialize webhook payload: {}", e);
+                    return;
+                }
+            };
+
+            let mut request = client.post(&url).json(&payload);
+
+            if let Some(sec) = secret {
+                type HmacSha256 = Hmac<Sha256>;
+                let mut mac = HmacSha256::new_from_slice(sec.as_bytes()).unwrap_or_else(|_| {
+                    tracing::warn!("Invalid HMAC secret for webhook");
+                    return;
+                });
+                mac.update(&payload_bytes);
+                let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+                request = request.header("X-Webhook-Signature", signature);
+            }
+
+            if let Err(e) = request.send().await {
                 tracing::warn!("Webhook delivery failed to {}: {}", url, e);
             }
         });
