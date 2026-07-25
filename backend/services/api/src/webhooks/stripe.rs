@@ -51,18 +51,19 @@ pub struct WebhookAck {
 /// Verify the HMAC-SHA256 signature supplied in `X-Webhook-Signature`.
 /// Returns `Ok(())` when valid, `Err(reason)` otherwise.
 pub fn verify_signature(secret: &str, body: &[u8], signature_header: &str) -> Result<(), &'static str> {
+    use subtle::ConstantTimeEq;
     type HmacSha256 = Hmac<Sha256>;
 
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|_| "invalid secret")?;
     mac.update(body);
 
-    let expected = mac.finalize().into_bytes();
-    let expected_hex = hex::encode(expected);
-
-    // Constant-time comparison via hex strings
+    let expected_mac = mac.finalize().into_bytes();
     let sig = signature_header.trim_start_matches("sha256=");
-    if sig != expected_hex {
+
+    let provided_bytes = hex::decode(sig).map_err(|_| "invalid hex in signature")?;
+
+    if expected_mac.ct_eq(&provided_bytes[..]).unwrap_u8() == 0 {
         return Err("signature mismatch");
     }
     Ok(())
